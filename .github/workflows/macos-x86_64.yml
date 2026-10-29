@@ -1,0 +1,147 @@
+name: Build macOS x86_64 Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_game:
+        description: 'Also build the game client binaries (horizon-client, horizon-ctl, etc.)'
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+      - feat/macos-x64*
+      - macos-x86_64*
+    paths:
+      - 'launcher/**'
+      - 'packaging/macos/**'
+      - '.github/workflows/macos-x86_64.yml'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - 'launcher/**'
+      - 'packaging/macos/**'
+      - '.github/workflows/macos-x86_64.yml'
+
+concurrency:
+  group: macos-x86_64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-launcher:
+    name: Build Horizon Launcher (macOS x86_64)
+    runs-on: macos-13
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: launcher-macos-x86_64
+
+      - name: Setup Python & dmgbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dmg"
+          "$RUNNER_TEMP/dmg/bin/pip" install --quiet dmgbuild==1.6.5
+          echo "$RUNNER_TEMP/dmg/bin" >> "$GITHUB_PATH"
+
+      - name: Detect Metal toolchain / configure features
+        working-directory: launcher
+        run: |
+          if ! xcrun metal --version > /dev/null 2>&1; then
+            echo "::notice::No Metal toolchain on this runner: GPUI compiles its shaders at run time"
+            echo "LAUNCHER_FEATURES=gpui/runtime_shaders" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build horizon-launcher
+        working-directory: launcher
+        run: |
+          cargo build --release --locked ${LAUNCHER_FEATURES:+--features "$LAUNCHER_FEATURES"}
+
+      - name: Verify binary
+        working-directory: launcher
+        run: |
+          file target/release/horizon-launcher
+          lipo -archs target/release/horizon-launcher | grep -w x86_64
+          target/release/horizon-launcher --version
+
+      - name: Package Horizon.app (.app, .zip, .dmg)
+        working-directory: launcher
+        run: |
+          rm -rf out && mkdir -p out
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          DMGBUILD="$RUNNER_TEMP/dmg/bin/dmgbuild" ../packaging/macos/package.sh target/release/horizon-launcher "$version" out x64
+          # Also package Horizon.app bundle itself directly as a zip
+          (cd out && ditto -c -k --norsrc --noextattr --noqtn --keepParent Horizon.app Horizon.app.zip)
+          ls -la out
+
+      - name: Upload Launcher App & Installer Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Horizon-Launcher-macos-x86_64
+          path: |
+            launcher/out/Horizon.app.zip
+            launcher/out/horizon-launcher-macos-x64.zip
+            launcher/out/horizon-launcher-macos-x86_64.zip
+            launcher/out/horizon-launcher-macos-x64.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  build-game:
+    name: Build Horizon Game Client (macOS x86_64)
+    if: github.event_name != 'workflow_dispatch' || inputs.build_game == true
+    runs-on: macos-13
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: game-macos-x86_64
+
+      - name: Build Client, Server, Prepare, and Ctl
+        run: |
+          cargo build --release --locked -p horizon-client --bin horizon-client --bin horizon-ctl -p horizon-prepare --bin horizon-prepare -p horizon-server --bin horizon-server
+
+      - name: Verify binaries architecture
+        run: |
+          for b in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            echo "Checking $b:"
+            file "target/release/$b"
+            lipo -archs "target/release/$b" | grep -w x86_64
+          done
+
+      - name: Package game directory
+        run: |
+          mkdir -p dist/horizon-macos-x86_64
+          for b in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            cp "target/release/$b" dist/horizon-macos-x86_64/
+          done
+          cp -r tools dist/horizon-macos-x86_64/ || true
+          cp packaging/PLAY.txt dist/horizon-macos-x86_64/ || true
+          (cd dist && ditto -c -k --norsrc --noextattr --noqtn --keepParent horizon-macos-x86_64 horizon-macos-x86_64.zip)
+          ls -la dist
+
+      - name: Upload Game Client Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Horizon-Game-macos-x86_64
+          path: dist/horizon-macos-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
