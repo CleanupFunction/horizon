@@ -26,13 +26,13 @@ on:
       - '.github/workflows/macos-x86_64.yml'
 
 concurrency:
-  group: macos-x86_64-${{ github.ref }}
+  group: macos-x86_64-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-launcher:
     name: Build Horizon Launcher (macOS x86_64)
-    runs-on: macos-13
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -62,24 +62,23 @@ jobs:
             echo "LAUNCHER_FEATURES=gpui/runtime_shaders" >> "$GITHUB_ENV"
           fi
 
-      - name: Build horizon-launcher
+      - name: Build horizon-launcher for x86_64
         working-directory: launcher
         run: |
-          cargo build --release --locked ${LAUNCHER_FEATURES:+--features "$LAUNCHER_FEATURES"}
+          cargo build --release --locked --target x86_64-apple-darwin ${LAUNCHER_FEATURES:+--features "$LAUNCHER_FEATURES"}
 
-      - name: Verify binary
+      - name: Verify x86_64 binary
         working-directory: launcher
         run: |
-          file target/release/horizon-launcher
-          lipo -archs target/release/horizon-launcher | grep -w x86_64
-          target/release/horizon-launcher --version
+          file target/x86_64-apple-darwin/release/horizon-launcher
+          lipo -archs target/x86_64-apple-darwin/release/horizon-launcher | grep -w x86_64
 
       - name: Package Horizon.app (.app, .zip, .dmg)
         working-directory: launcher
         run: |
           rm -rf out && mkdir -p out
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          DMGBUILD="$RUNNER_TEMP/dmg/bin/dmgbuild" ../packaging/macos/package.sh target/release/horizon-launcher "$version" out x64
+          DMGBUILD="$RUNNER_TEMP/dmg/bin/dmgbuild" ../packaging/macos/package.sh target/x86_64-apple-darwin/release/horizon-launcher "$version" out x64
           # Also package Horizon.app bundle itself directly as a zip
           (cd out && ditto -c -k --norsrc --noextattr --noqtn --keepParent Horizon.app Horizon.app.zip)
           ls -la out
@@ -99,7 +98,7 @@ jobs:
   build-game:
     name: Build Horizon Game Client (macOS x86_64)
     if: github.event_name != 'workflow_dispatch' || inputs.build_game == true
-    runs-on: macos-13
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -115,23 +114,23 @@ jobs:
         with:
           shared-key: game-macos-x86_64
 
-      - name: Build Client, Server, Prepare, and Ctl
+      - name: Build Client, Server, Prepare, and Ctl for x86_64
         run: |
-          cargo build --release --locked -p horizon-client --bin horizon-client --bin horizon-ctl -p horizon-prepare --bin horizon-prepare -p horizon-server --bin horizon-server
+          cargo build --release --locked --target x86_64-apple-darwin -p horizon-client --bin horizon-client --bin horizon-ctl -p horizon-prepare --bin horizon-prepare -p horizon-server --bin horizon-server
 
       - name: Verify binaries architecture
         run: |
           for b in horizon-client horizon-ctl horizon-prepare horizon-server; do
             echo "Checking $b:"
-            file "target/release/$b"
-            lipo -archs "target/release/$b" | grep -w x86_64
+            file "target/x86_64-apple-darwin/release/$b"
+            lipo -archs "target/x86_64-apple-darwin/release/$b" | grep -w x86_64
           done
 
       - name: Package game directory
         run: |
           mkdir -p dist/horizon-macos-x86_64
           for b in horizon-client horizon-ctl horizon-prepare horizon-server; do
-            cp "target/release/$b" dist/horizon-macos-x86_64/
+            cp "target/x86_64-apple-darwin/release/$b" dist/horizon-macos-x86_64/
           done
           cp -r tools dist/horizon-macos-x86_64/ || true
           cp packaging/PLAY.txt dist/horizon-macos-x86_64/ || true
