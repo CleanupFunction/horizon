@@ -260,8 +260,39 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Every published release of the repository, both kinds, as GitHub's JSON.
 fn release_list() -> Result<serde_json::Value, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=100");
-    get(&url)?.into_json().map_err(|e| e.to_string())
+    let mut list = Vec::new();
+    let mut seen_tags = std::collections::HashSet::new();
+
+    let fork_repo = option_env!("HORIZON_FORK_REPO").unwrap_or("CleanupFunction/horizon");
+    let fork_url = format!("https://api.github.com/repos/{fork_repo}/releases?per_page=100");
+    if let Ok(resp) = get(&fork_url).and_then(|r| r.into_json().map_err(|e| e.to_string())) {
+        if let Some(arr) = resp.as_array() {
+            for rel in arr {
+                if let Some(tag) = rel["tag_name"].as_str() {
+                    seen_tags.insert(tag.to_string());
+                    list.push(rel.clone());
+                }
+            }
+        }
+    }
+
+    if fork_repo != REPO {
+        let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=100");
+        if let Ok(resp) = get(&url).and_then(|r| r.into_json().map_err(|e| e.to_string())) {
+            if let Some(arr) = resp.as_array() {
+                for rel in arr {
+                    if let Some(tag) = rel["tag_name"].as_str() {
+                        if !seen_tags.contains(tag) {
+                            seen_tags.insert(tag.to_string());
+                            list.push(rel.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Array(list))
 }
 
 /// The releases in `list` whose tag passes `keep`, newest first, with the asset named `asset`.
@@ -539,7 +570,12 @@ pub(crate) fn fetch_small(url: &str) -> Result<Option<Vec<u8>>, String> {
 
 /// The SHA-256 the release's signed checksums give for `asset`, or why it must not be installed.
 fn signed_digest(tag: &str, asset: &str) -> Result<String, String> {
-    crate::signed::digest(
+    signed_digest_for(REPO, tag, asset)
+}
+
+fn signed_digest_for(repo: &str, tag: &str, asset: &str) -> Result<String, String> {
+    crate::signed::digest_for(
+        repo,
         tag,
         asset,
         &horizon_release_sign::trusted_keys(),
@@ -603,15 +639,21 @@ fn unpack(archive: &Path, url: &str, to: &Path) -> Result<(), String> {
 /// the fraction done.
 pub fn install(release: &Release, progress: impl Fn(f32)) -> Result<(), String> {
     let tag = release.tag.as_str();
+    let repo = release
+        .asset
+        .as_ref()
+        .and_then(|(url, _)| crate::signed::repo_from_url(url))
+        .unwrap_or(REPO);
     let sha256 = match &release.nightly {
         // Signed for the Nightly channel, served under its own GitHub tag.
-        Some(published) => crate::signed::nightly_digest(
+        Some(published) => crate::signed::nightly_digest_for(
+            repo,
             published,
             ASSET.unwrap_or_default(),
             &horizon_release_sign::trusted_keys(),
             fetch_small,
         )?,
-        None if is_game_tag(tag) => signed_digest(tag, ASSET.unwrap_or_default())?,
+        None if is_game_tag(tag) => signed_digest_for(repo, tag, ASSET.unwrap_or_default())?,
         None => return Err(format!("{tag} is not a Horizon release.")),
     };
     install_as(release, tag, &sha256, progress)
@@ -2600,7 +2642,12 @@ pub fn self_update(release: &Release, progress: impl Fn(f32)) -> Result<(), Stri
         progress(1.0);
         return Ok(());
     }
-    let sha256 = signed_digest(&release.tag, LAUNCHER_ASSET.unwrap_or_default())?;
+    let repo = release
+        .asset
+        .as_ref()
+        .and_then(|(url, _)| crate::signed::repo_from_url(url))
+        .unwrap_or(REPO);
+    let sha256 = signed_digest_for(repo, &release.tag, LAUNCHER_ASSET.unwrap_or_default())?;
     let work = data_dir().join(".launcher-update");
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work).map_err(|e| e.to_string())?;

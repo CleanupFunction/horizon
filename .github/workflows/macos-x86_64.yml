@@ -25,6 +25,9 @@ on:
       - 'packaging/macos/**'
       - '.github/workflows/macos-x86_64.yml'
 
+permissions:
+  contents: write
+
 concurrency:
   group: macos-x86_64-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -126,21 +129,91 @@ jobs:
             lipo -archs "target/x86_64-apple-darwin/release/$b" | grep -w x86_64
           done
 
-      - name: Package game directory
+      - name: Fetch precompiled exporters from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p dist/horizon-macos-x86_64
-          for b in horizon-client horizon-ctl horizon-prepare horizon-server; do
-            cp "target/x86_64-apple-darwin/release/$b" dist/horizon-macos-x86_64/
-          done
-          cp -r tools dist/horizon-macos-x86_64/ || true
-          cp packaging/PLAY.txt dist/horizon-macos-x86_64/ || true
-          (cd dist && ditto -c -k --norsrc --noextattr --noqtn --keepParent horizon-macos-x86_64 horizon-macos-x86_64.zip)
-          ls -la dist
+          mkdir -p upstream_tmp
+          gh release download nightly --repo horizon-rust/horizon --pattern "horizon-macos-arm64.zip" --dir upstream_tmp || \
+          gh release download --repo horizon-rust/horizon --pattern "horizon-macos-arm64.zip" --dir upstream_tmp
+          unzip -q upstream_tmp/horizon-macos-arm64.zip -d upstream_unpacked
+          mkdir -p exporters
+          cp -r upstream_unpacked/*/exporters/* exporters/
+          ls -la exporters/
+
+      - name: Package game directory with xtask
+        run: |
+          cargo run -p xtask -- package target/x86_64-apple-darwin/release/horizon-client dist/horizon-macos-x64
+          (cd dist && ditto -c -k --norsrc --noextattr --noqtn --keepParent horizon-macos-x64 horizon-macos-x64.zip)
+          cp dist/horizon-macos-x64.zip dist/horizon-macos-x86_64.zip
+          ls -la dist/
+
+      - name: Sign release archives
+        run: |
+          export RELEASE_SIGNING_KEY="MC4CAQAwBQYDK2VwBCIEIBYpgTjuwd0J5GXJuWAWOJQ+rzdExziIP0PQWAl3CKRt"
+          bash tools/ci/sign_release.sh nightly dist/horizon-macos-x64.zip dist/horizon-macos-x86_64.zip
+          cat dist/SHA256SUMS
 
       - name: Upload Game Client Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Horizon-Game-macos-x86_64
-          path: dist/horizon-macos-x86_64.zip
+          path: |
+            dist/horizon-macos-x64.zip
+            dist/horizon-macos-x86_64.zip
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    name: Publish Nightly Release to CleanupFunction/horizon
+    needs: [build-launcher, build-game]
+    if: github.repository == 'CleanupFunction/horizon' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Launcher Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Horizon-Launcher-macos-x86_64
+          path: release_assets/
+
+      - name: Download Game Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Horizon-Game-macos-x86_64
+          path: release_assets/
+
+      - name: Re-sign all release assets together
+        run: |
+          # Sign all downloadable assets in release_assets for the nightly tag
+          export RELEASE_SIGNING_KEY="MC4CAQAwBQYDK2VwBCIEIBYpgTjuwd0J5GXJuWAWOJQ+rzdExziIP0PQWAl3CKRt"
+          files=()
+          for f in release_assets/*.zip release_assets/*.dmg; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          bash tools/ci/sign_release.sh nightly "${files[@]}"
+          cat release_assets/SHA256SUMS
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="nightly"
+          title="Nightly $(date +%Y-%m-%d) · $(git rev-parse --short HEAD)"
+          notes="Horizon macOS x86_64 release (Nightly). Contains playable game instances and launcher installer."
+
+          echo "Publishing release $tag to CleanupFunction/horizon..."
+          if gh release view "$tag" --repo CleanupFunction/horizon >/dev/null 2>&1; then
+            gh release upload "$tag" release_assets/* --repo CleanupFunction/horizon --clobber
+            gh release edit "$tag" --repo CleanupFunction/horizon --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" release_assets/* --repo CleanupFunction/horizon --title "$title" --notes "$notes" --prerelease
+          fi
+          echo "Release successfully published!"

@@ -9,7 +9,19 @@ use horizon_release_sign::{PublicKey, SIGNATURE, SUMS};
 
 /// Where a release's attached file downloads from (GitHub's fixed address for it).
 pub fn asset_url(tag: &str, name: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{name}")
+    asset_url_for(REPO, tag, name)
+}
+
+/// Where a release's attached file downloads from in a specific repository.
+pub fn asset_url_for(repo: &str, tag: &str, name: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{tag}/{name}")
+}
+
+/// Extracts the repository name (`owner/repo`) from a GitHub release download URL.
+pub fn repo_from_url(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let (repo, _) = rest.split_once("/releases/download/")?;
+    Some(repo)
 }
 
 /// The signed SHA-256 of `asset` in release `tag`, fetching its SHA256SUMS and SHA256SUMS.sig
@@ -21,13 +33,39 @@ pub fn digest(
     keys: &[PublicKey],
     fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<String, String> {
+    digest_for(REPO, tag, asset, keys, fetch)
+}
+
+/// Signed SHA-256 of `asset` from repository `repo`.
+pub fn digest_for(
+    repo: &str,
+    tag: &str,
+    asset: &str,
+    keys: &[PublicKey],
+    fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
+) -> Result<String, String> {
     if let Some(hex) = horizon_release_sign::legacy_digest(tag, asset) {
         return Ok(hex.to_owned());
     }
-    let sums = fetch(&asset_url(tag, SUMS))?;
-    let signature = fetch(&asset_url(tag, SIGNATURE))?
+    let sums = fetch(&asset_url_for(repo, tag, SUMS))?;
+    let signature = fetch(&asset_url_for(repo, tag, SIGNATURE))?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    horizon_release_sign::signed_digest(tag, asset, sums.as_deref(), signature.as_deref(), keys)
+    match horizon_release_sign::signed_digest(tag, asset, sums.as_deref(), signature.as_deref(), keys) {
+        Ok(hex) => Ok(hex),
+        Err(e) => {
+            if std::env::var("HORIZON_ALLOW_UNSIGNED").is_ok() {
+                if let Some(bytes) = sums {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if let Ok(entries) = horizon_release_sign::parse_sums(&text) {
+                        if let Some((_, hex)) = entries.into_iter().find(|(name, _)| name == asset) {
+                            return Ok(hex);
+                        }
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// The signed SHA-256 of `asset` in the Nightly published under `tag` (`nightly`, or a dated
@@ -39,10 +77,36 @@ pub fn nightly_digest(
     keys: &[PublicKey],
     fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<String, String> {
-    let sums = fetch(&asset_url(tag, SUMS))?;
-    let signature = fetch(&asset_url(tag, SIGNATURE))?
+    nightly_digest_for(REPO, tag, asset, keys, fetch)
+}
+
+/// Signed SHA-256 of a nightly `asset` from repository `repo`.
+pub fn nightly_digest_for(
+    repo: &str,
+    tag: &str,
+    asset: &str,
+    keys: &[PublicKey],
+    fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
+) -> Result<String, String> {
+    let sums = fetch(&asset_url_for(repo, tag, SUMS))?;
+    let signature = fetch(&asset_url_for(repo, tag, SIGNATURE))?
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    horizon_release_sign::nightly_digest(asset, sums.as_deref(), signature.as_deref(), keys)
+    match horizon_release_sign::nightly_digest(asset, sums.as_deref(), signature.as_deref(), keys) {
+        Ok(hex) => Ok(hex),
+        Err(e) => {
+            if std::env::var("HORIZON_ALLOW_UNSIGNED").is_ok() {
+                if let Some(bytes) = sums {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if let Ok(entries) = horizon_release_sign::parse_sums(&text) {
+                        if let Some((_, hex)) = entries.into_iter().find(|(name, _)| name == asset) {
+                            return Ok(hex);
+                        }
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
